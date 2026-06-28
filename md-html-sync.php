@@ -181,19 +181,27 @@ final class MD_HTML_Sync_Plugin
             return;
         }
 
+        $front_matter = self::parse_front_matter($markdown);
         $html = self::render_markdown($markdown);
         $current_content = (string) get_post_field('post_content', $post_id, 'raw');
+        $post_update = self::build_post_update_from_front_matter($post_id, $html, $front_matter);
 
         if ($current_content === $html) {
+            unset($post_update['post_content']);
+        }
+
+        if (1 === count($post_update)) {
+            self::sync_front_matter_terms($post_id, $front_matter);
             return;
         }
 
         self::$is_syncing = true;
-        wp_update_post([
-            'ID' => $post_id,
-            'post_content' => $html,
-        ]);
-        self::$is_syncing = false;
+        try {
+            wp_update_post($post_update);
+            self::sync_front_matter_terms($post_id, $front_matter);
+        } finally {
+            self::$is_syncing = false;
+        }
     }
 
     public static function sanitize_markdown_meta($value): string
@@ -207,9 +215,187 @@ final class MD_HTML_Sync_Plugin
     public static function render_markdown(string $markdown): string
     {
         $markdown = self::sanitize_markdown_meta($markdown);
+        $markdown = self::extract_front_matter($markdown)['body'];
         $html = self::render_blocks($markdown);
 
         return wp_kses_post($html);
+    }
+
+    private static function parse_front_matter(string $markdown): array
+    {
+        return self::extract_front_matter($markdown)['data'];
+    }
+
+    private static function extract_front_matter(string $markdown): array
+    {
+        $lines = explode("\n", $markdown);
+        if ([] === $lines || '---' !== trim($lines[0])) {
+            return [
+                'body' => $markdown,
+                'data' => [],
+            ];
+        }
+
+        $line_count = count($lines);
+        for ($i = 1; $i < $line_count; $i++) {
+            if ('---' === trim($lines[$i])) {
+                $front_matter = implode("\n", array_slice($lines, 1, $i - 1));
+
+                return [
+                    'body' => implode("\n", array_slice($lines, $i + 1)),
+                    'data' => self::parse_front_matter_block($front_matter),
+                ];
+            }
+        }
+
+        return [
+            'body' => $markdown,
+            'data' => [],
+        ];
+    }
+
+    private static function parse_front_matter_block(string $front_matter): array
+    {
+        $data = [];
+        $current_key = null;
+
+        foreach (explode("\n", $front_matter) as $line) {
+            if ('' === trim($line)) {
+                continue;
+            }
+
+            if (preg_match('/^([A-Za-z0-9_-]+):\s*(.*)$/u', $line, $matches)) {
+                $key = sanitize_key($matches[1]);
+                $value = trim($matches[2]);
+
+                if ('' === $value) {
+                    $data[$key] = [];
+                    $current_key = $key;
+                    continue;
+                }
+
+                $data[$key] = self::parse_front_matter_scalar($value);
+                $current_key = null;
+                continue;
+            }
+
+            if (null !== $current_key && preg_match('/^\s*-\s*(.*)$/u', $line, $matches)) {
+                $data[$current_key][] = self::parse_front_matter_scalar(trim($matches[1]));
+            }
+        }
+
+        return $data;
+    }
+
+    private static function parse_front_matter_scalar(string $value): string
+    {
+        $value = trim($value);
+
+        if (strlen($value) >= 2) {
+            $quote = $value[0];
+            if (('"' === $quote || "'" === $quote) && substr($value, -1) === $quote) {
+                $value = substr($value, 1, -1);
+                if ('"' === $quote) {
+                    $value = stripcslashes($value);
+                }
+            }
+        }
+
+        return wp_check_invalid_utf8($value);
+    }
+
+    private static function build_post_update_from_front_matter(int $post_id, string $html, array $front_matter): array
+    {
+        $post_update = [
+            'ID' => $post_id,
+            'post_content' => $html,
+        ];
+
+        $title = self::get_front_matter_string($front_matter, 'title');
+        if ('' !== $title) {
+            $post_update['post_title'] = wp_strip_all_tags($title);
+        }
+
+        $slug = self::get_front_matter_string($front_matter, 'slug');
+        if ('' !== $slug) {
+            $post_update['post_name'] = sanitize_title($slug);
+        }
+
+        $excerpt = self::get_front_matter_string($front_matter, 'excerpt');
+        if ('' !== $excerpt) {
+            $post_update['post_excerpt'] = wp_strip_all_tags($excerpt);
+        }
+
+        $published_at = self::get_front_matter_string($front_matter, 'published_at');
+        $post_date = self::parse_front_matter_date($published_at);
+        if ('' !== $post_date) {
+            $post_update['post_date'] = $post_date;
+            $post_update['post_date_gmt'] = get_gmt_from_date($post_date);
+        }
+
+        return $post_update;
+    }
+
+    private static function sync_front_matter_terms(int $post_id, array $front_matter): void
+    {
+        $categories = self::get_front_matter_list($front_matter, 'taxonomy_category');
+        if ([] !== $categories && taxonomy_exists('category')) {
+            wp_set_object_terms($post_id, $categories, 'category', false);
+        }
+
+        $tags = self::get_front_matter_list($front_matter, 'taxonomy_post_tag');
+        if ([] !== $tags && taxonomy_exists('post_tag')) {
+            wp_set_object_terms($post_id, $tags, 'post_tag', false);
+        }
+    }
+
+    private static function get_front_matter_string(array $front_matter, string $key): string
+    {
+        if (! isset($front_matter[$key]) || is_array($front_matter[$key])) {
+            return '';
+        }
+
+        return trim((string) $front_matter[$key]);
+    }
+
+    private static function get_front_matter_list(array $front_matter, string $key): array
+    {
+        if (! isset($front_matter[$key]) || ! is_array($front_matter[$key])) {
+            return [];
+        }
+
+        $values = array_map(static function ($value): string {
+            return trim(wp_strip_all_tags((string) $value));
+        }, $front_matter[$key]);
+
+        return array_values(array_filter($values, static function (string $value): bool {
+            return '' !== $value;
+        }));
+    }
+
+    private static function parse_front_matter_date(string $value): string
+    {
+        $value = trim($value);
+        if ('' === $value) {
+            return '';
+        }
+
+        $timezone = wp_timezone();
+        if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $value)) {
+            $date = DateTimeImmutable::createFromFormat('!Y-m-d', $value, $timezone);
+        } else {
+            try {
+                $date = new DateTimeImmutable($value, $timezone);
+            } catch (Exception $exception) {
+                return '';
+            }
+        }
+
+        if (! $date instanceof DateTimeImmutable) {
+            return '';
+        }
+
+        return $date->setTimezone($timezone)->format('Y-m-d H:i:s');
     }
 
     /**
@@ -250,6 +436,21 @@ final class MD_HTML_Sync_Plugin
             if (preg_match('/^\s{0,3}(#{1,6})\s+(.+)$/u', $line, $matches)) {
                 $level = strlen($matches[1]);
                 $html[] = '<h' . $level . '>' . self::parse_inline(trim($matches[2])) . '</h' . $level . '>';
+                continue;
+            }
+
+            if ($i + 1 < $line_count && self::is_table_separator_line($lines[$i + 1]) && self::is_table_row_line($line)) {
+                $header_cells = self::split_table_row($line);
+                $rows = [];
+                $i += 2;
+
+                while ($i < $line_count && self::is_table_row_line($lines[$i])) {
+                    $rows[] = self::split_table_row($lines[$i]);
+                    $i++;
+                }
+
+                $i--;
+                $html[] = self::render_table($header_cells, $rows);
                 continue;
             }
 
@@ -329,8 +530,10 @@ final class MD_HTML_Sync_Plugin
             return $add_token('<code>' . esc_html($matches[1]) . '</code>');
         }, $text);
 
-        $text = preg_replace_callback('/!\[([^\]]*)\]\((\S+?)(?:\s+"([^"]*)")?\)/u', static function (array $matches) use ($add_token): string {
-            $url = esc_url($matches[2]);
+        $link_label_pattern = '((?:[^\[\]]|\[[^\[\]]*\])*)';
+
+        $text = preg_replace_callback('/!\[' . $link_label_pattern . '\]\((\S+?)(?:\s+"([^"]*)")?\)/u', static function (array $matches) use ($add_token): string {
+            $url = self::sanitize_markdown_url($matches[2]);
             if ('' === $url) {
                 return $matches[0];
             }
@@ -340,8 +543,8 @@ final class MD_HTML_Sync_Plugin
             return $add_token('<img src="' . $url . '" alt="' . esc_attr($matches[1]) . '"' . $title . ' />');
         }, $text);
 
-        $text = preg_replace_callback('/(?<!!)\[([^\]]+)\]\((\S+?)(?:\s+"([^"]*)")?\)/u', static function (array $matches) use ($add_token): string {
-            $url = esc_url($matches[2]);
+        $text = preg_replace_callback('/(?<!!)\[' . $link_label_pattern . '\]\((\S+?)(?:\s+"([^"]*)")?\)/u', static function (array $matches) use ($add_token): string {
+            $url = self::sanitize_markdown_url($matches[2]);
             if ('' === $url) {
                 return $matches[0];
             }
@@ -365,9 +568,83 @@ final class MD_HTML_Sync_Plugin
         $text = (string) preg_replace('/__(.+?)__/su', '<strong>$1</strong>', $text);
         $text = (string) preg_replace('/~~(.+?)~~/su', '<del>$1</del>', $text);
         $text = (string) preg_replace('/(^|[^\*])\*([^\*\n]+)\*(?!\*)/su', '$1<em>$2</em>', $text);
-        $text = (string) preg_replace('/(^|[^_])_([^_\n]+)_(?!_)/su', '$1<em>$2</em>', $text);
+        $text = (string) preg_replace('/(?<![A-Za-z0-9_])_([^_\n]+)_(?![A-Za-z0-9_])/su', '<em>$1</em>', $text);
 
         return strtr($text, $tokens);
+    }
+
+    private static function sanitize_markdown_url(string $url): string
+    {
+        $url = trim(wp_check_invalid_utf8($url));
+        $url = str_replace(["\r", "\n", "\t"], '', $url);
+
+        if ('' === $url) {
+            return '';
+        }
+
+        if (preg_match('/^(?:[A-Za-z][A-Za-z0-9+.-]*:|\/\/)/', $url)) {
+            return esc_url($url);
+        }
+
+        if (wp_kses_bad_protocol($url, wp_allowed_protocols()) !== $url) {
+            return '';
+        }
+
+        return esc_attr($url);
+    }
+
+    private static function is_table_row_line(string $line): bool
+    {
+        return false !== strpos(trim($line), '|');
+    }
+
+    private static function is_table_separator_line(string $line): bool
+    {
+        $cells = self::split_table_row($line);
+        if (count($cells) < 2) {
+            return false;
+        }
+
+        foreach ($cells as $cell) {
+            if (1 !== preg_match('/^:?-{3,}:?$/', trim($cell))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static function split_table_row(string $line): array
+    {
+        $line = trim($line);
+        $line = trim($line, '|');
+
+        return array_map('trim', explode('|', $line));
+    }
+
+    private static function render_table(array $header_cells, array $rows): string
+    {
+        $html = ['<table>', '<thead><tr>'];
+
+        foreach ($header_cells as $cell) {
+            $html[] = '<th>' . self::parse_inline($cell) . '</th>';
+        }
+
+        $html[] = '</tr></thead>';
+        $html[] = '<tbody>';
+
+        foreach ($rows as $row) {
+            $html[] = '<tr>';
+            foreach ($header_cells as $index => $_cell) {
+                $html[] = '<td>' . self::parse_inline($row[$index] ?? '') . '</td>';
+            }
+            $html[] = '</tr>';
+        }
+
+        $html[] = '</tbody>';
+        $html[] = '</table>';
+
+        return implode('', $html);
     }
 
     private static function is_block_start(string $line): bool
