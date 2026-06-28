@@ -685,13 +685,23 @@ final class MD_HTML_Sync_Plugin
                 continue;
             }
 
+            $content_url = self::get_attachment_content_url((int) $attachment_id, $url);
+            $webp_id = absint(get_post_meta((int) $attachment_id, '_maomomo_tinypng_webp_id', true));
+            $webp_url = $webp_id > 0 ? wp_get_attachment_url($webp_id) : '';
+            if (! is_string($webp_url)) {
+                $webp_url = '';
+            }
+
             $items[$normalized_path] = [
                 'id' => (int) $attachment_id,
                 'path' => $normalized_path,
                 'url' => $url,
+                'content_url' => $content_url,
+                'webp_id' => $webp_id,
+                'webp_url' => $webp_url,
             ];
-            $url_map[$normalized_path] = $url;
-            $url_map[basename($normalized_path)] = $url;
+            $url_map[$normalized_path] = $content_url;
+            $url_map[basename($normalized_path)] = $content_url;
             $id_map[$normalized_path] = (int) $attachment_id;
             $id_map[basename($normalized_path)] = (int) $attachment_id;
         }
@@ -701,6 +711,25 @@ final class MD_HTML_Sync_Plugin
             'url_map' => $url_map,
             'id_map' => $id_map,
         ];
+    }
+
+    private static function get_attachment_content_url(int $attachment_id, string $fallback_url): string
+    {
+        $webp_id = absint(get_post_meta($attachment_id, '_maomomo_tinypng_webp_id', true));
+        if ($webp_id <= 0 || 'attachment' !== get_post_type($webp_id)) {
+            return $fallback_url;
+        }
+
+        if ('image/webp' !== get_post_mime_type($webp_id)) {
+            return $fallback_url;
+        }
+
+        $webp_url = wp_get_attachment_url($webp_id);
+        if (! is_string($webp_url) || '' === $webp_url) {
+            return $fallback_url;
+        }
+
+        return $webp_url;
     }
 
     private static function rewrite_markdown_asset_urls(string $markdown, array $url_map): string
