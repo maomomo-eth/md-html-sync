@@ -351,6 +351,15 @@ final class MD_HTML_Sync_Plugin
             return $add_token('<a href="' . $url . '"' . $title . '>' . esc_html($matches[1]) . '</a>');
         }, $text);
 
+        if (function_exists('get_shortcode_regex')) {
+            $shortcode_pattern = get_shortcode_regex();
+            if ('' !== $shortcode_pattern) {
+                $text = preg_replace_callback('/' . $shortcode_pattern . '/su', static function (array $matches) use ($add_token): string {
+                    return $add_token(str_replace(['<', '>'], ['&lt;', '&gt;'], $matches[0]));
+                }, $text);
+            }
+        }
+
         $text = esc_html($text);
         $text = (string) preg_replace('/\*\*(.+?)\*\*/su', '<strong>$1</strong>', $text);
         $text = (string) preg_replace('/__(.+?)__/su', '<strong>$1</strong>', $text);
