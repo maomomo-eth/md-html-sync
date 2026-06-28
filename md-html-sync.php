@@ -319,7 +319,7 @@ final class MD_HTML_Sync_Plugin
     {
         $tokens = [];
         $add_token = static function (string $html) use (&$tokens): string {
-            $key = '%%MD_HTML_SYNC_TOKEN_' . count($tokens) . '%%';
+            $key = '%%MDHTMLSYNCTOKEN' . count($tokens) . '%%';
             $tokens[$key] = $html;
 
             return $key;
