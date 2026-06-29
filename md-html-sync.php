@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Markdown HTML Sync
  * Description: 在文章编辑页维护 Markdown 源内容，保存时自动生成并同步 HTML 正文。
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      Codex
  * License:     GPL-2.0-or-later
  * Text Domain: md-html-sync
@@ -15,7 +15,7 @@ if (! defined('ABSPATH')) {
 
 final class MD_HTML_Sync_Plugin
 {
-    private const VERSION = '1.0.0';
+    private const VERSION = '1.1.0';
     private const META_MARKDOWN = '_md_html_sync_markdown';
     private const META_ENABLED = '_md_html_sync_enabled';
     private const NONCE_ACTION = 'md_html_sync_save';
@@ -24,6 +24,7 @@ final class MD_HTML_Sync_Plugin
     private const FIELD_ENABLED = 'md_html_sync_enabled';
     private const REST_NAMESPACE = 'md-html-sync/v1';
     private const MAX_IMPORT_BYTES = 52428800;
+    private const TINYPNG_WEBP_REFRESH_HOOK = 'md_html_sync_refresh_tinypng_webp_references';
 
     private static $is_syncing = false;
 
@@ -34,6 +35,8 @@ final class MD_HTML_Sync_Plugin
         add_action('add_meta_boxes', [__CLASS__, 'add_meta_boxes']);
         add_action('save_post', [__CLASS__, 'save_post'], 20, 2);
         add_action('admin_enqueue_scripts', [__CLASS__, 'enqueue_admin_styles']);
+        add_action('maomomo_tinypng_attachment_processed', [__CLASS__, 'handle_tinypng_attachment_processed'], 10, 3);
+        add_action(self::TINYPNG_WEBP_REFRESH_HOOK, [__CLASS__, 'refresh_tinypng_webp_references_event'], 10, 4);
     }
 
     public static function register_rest_routes(): void
@@ -469,6 +472,127 @@ final class MD_HTML_Sync_Plugin
             'markdown_url' => function_exists('maomomo_markdown_build_url') ? maomomo_markdown_build_url(get_permalink($post_id)) : '',
             'attachments' => array_values($attachments['items']),
         ]);
+    }
+
+    public static function handle_tinypng_attachment_processed($attachment_id, $mode, $summary): void
+    {
+        $mode = sanitize_key((string) $mode);
+        if (! in_array($mode, ['webp', 'both'], true)) {
+            return;
+        }
+
+        $attachment_id = absint($attachment_id);
+        $webp_id = absint(get_post_meta($attachment_id, '_maomomo_tinypng_webp_id', true));
+        if ($attachment_id <= 0 || $webp_id <= 0 || 'attachment' !== get_post_type($webp_id)) {
+            return;
+        }
+
+        if ('image/webp' !== get_post_mime_type($webp_id)) {
+            return;
+        }
+
+        $post_id = absint(get_post_field('post_parent', $attachment_id));
+        if ($post_id <= 0) {
+            return;
+        }
+
+        self::refresh_tinypng_webp_references($post_id, $attachment_id, $webp_id, 0);
+    }
+
+    public static function refresh_tinypng_webp_references_event($post_id, $attachment_id, $webp_id, $attempt = 0): void
+    {
+        self::refresh_tinypng_webp_references(absint($post_id), absint($attachment_id), absint($webp_id), absint($attempt));
+    }
+
+    private static function refresh_tinypng_webp_references(int $post_id, int $attachment_id, int $webp_id, int $attempt): void
+    {
+        $post = get_post($post_id);
+        if (! $post instanceof WP_Post || ! in_array($post->post_type, self::get_supported_post_types(), true)) {
+            return;
+        }
+
+        if ('1' !== (string) get_post_meta($post_id, self::META_ENABLED, true)) {
+            self::schedule_tinypng_webp_refresh($post_id, $attachment_id, $webp_id, $attempt + 1);
+            return;
+        }
+
+        $source_url = wp_get_attachment_url($attachment_id);
+        $webp_url = wp_get_attachment_url($webp_id);
+        if (! is_string($source_url) || '' === $source_url || ! is_string($webp_url) || '' === $webp_url || $source_url === $webp_url) {
+            return;
+        }
+
+        $markdown = (string) get_post_meta($post_id, self::META_MARKDOWN, true);
+        $content = (string) get_post_field('post_content', $post_id, 'raw');
+
+        if ('' === trim($markdown) && '' === trim($content)) {
+            self::schedule_tinypng_webp_refresh($post_id, $attachment_id, $webp_id, $attempt + 1);
+            return;
+        }
+
+        $next_markdown = self::replace_url_variants($markdown, $source_url, $webp_url);
+        $next_content = $content;
+
+        if ($next_markdown !== $markdown) {
+            $next_content = self::render_markdown($next_markdown);
+        } else {
+            $next_content = self::replace_url_variants($content, $source_url, $webp_url);
+        }
+
+        if ($next_markdown === $markdown && $next_content === $content) {
+            return;
+        }
+
+        self::$is_syncing = true;
+        try {
+            if ($next_markdown !== $markdown) {
+                update_post_meta($post_id, self::META_MARKDOWN, $next_markdown);
+                update_post_meta($post_id, self::META_ENABLED, '1');
+            }
+
+            wp_update_post([
+                'ID' => $post_id,
+                'post_content' => $next_content,
+            ]);
+        } finally {
+            self::$is_syncing = false;
+        }
+    }
+
+    private static function schedule_tinypng_webp_refresh(int $post_id, int $attachment_id, int $webp_id, int $attempt): void
+    {
+        if ($attempt > 5) {
+            return;
+        }
+
+        $delays = [
+            1 => 60,
+            2 => 300,
+            3 => 900,
+            4 => 1800,
+            5 => 3600,
+        ];
+        $delay = $delays[$attempt] ?? 3600;
+        $args = [$post_id, $attachment_id, $webp_id, $attempt];
+
+        if (wp_next_scheduled(self::TINYPNG_WEBP_REFRESH_HOOK, $args)) {
+            return;
+        }
+
+        wp_schedule_single_event(time() + $delay, self::TINYPNG_WEBP_REFRESH_HOOK, $args);
+    }
+
+    private static function replace_url_variants(string $text, string $old_url, string $new_url): string
+    {
+        if ('' === $text || '' === $old_url || $old_url === $new_url) {
+            return $text;
+        }
+
+        return str_replace(
+            [$old_url, str_replace('/', '\/', $old_url)],
+            [$new_url, str_replace('/', '\/', $new_url)],
+            $text
+        );
     }
 
     public static function sanitize_markdown_meta($value): string

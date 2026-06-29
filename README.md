@@ -21,6 +21,10 @@
 - 链接和图片
 - 粗体、斜体、删除线
 
+## TinyPNG WebP 集成
+
+如果同时启用了 `MaoMoMo TinyPNG Media`，当 TinyPNG 后台队列生成 WebP 附件后，本插件会把已导入文章中的原图 URL 回写为 WebP URL，并重新生成 HTML 正文。
+
 ## 注意事项
 
 - 启用同步后，文章正文会以 Markdown 生成结果为准；直接修改正文编辑器里的 HTML 后，下次保存会被 Markdown 重新覆盖。
